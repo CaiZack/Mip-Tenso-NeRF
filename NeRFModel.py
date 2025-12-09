@@ -5,9 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ray_utils import sample_along_rays, resample_along_rays, volumetric_rendering, namedtuple_map
-from pose_utils import to8b
+########## Origin from https://github.com/bebeal/mipnerf-pytorch/blob/main/model.py
+from ray_utils import sample_along_rays, resample_along_rays, volumetric_rendering
 
+"""
+    Two gaussian distribution
+"""
 def pdf_2d(x, y):
     return np.exp(-(x**2 + y**2)/2) / (2*np.pi)
 
@@ -65,6 +68,10 @@ def create_standard_1d_gaussian_weight_map(
     return weight, x_shift
 
 ########## Origin from https://github.com/bebeal/mipnerf-pytorch/blob/main/model.py
+"""
+    Positional Encoding with Intergration Implemented
+        Do IPE when variance is provided
+"""
 class PositionalEncoding(nn.Module):
     def __init__(self, min_deg, max_deg):
         super(PositionalEncoding, self).__init__()
@@ -89,223 +96,109 @@ class PositionalEncoding(nn.Module):
             return x_ret, x_ret
 
 """
-    Multiple-NeRF Model
-
-    Args:
-        input_ch: input XYZ channel (fixed 3)
-
+    TensoVMBase Model
+        Create VM decomposition parameters
+        Get density and color features
+    
+    If forward function contain position variance, Custom-IPE will be automatically processed.
 """
-class MultiNeRF(nn.Module):
+class TensorVMBase(nn.Module):
     def __init__(
             self,
             device: str = 'cpu',
-            # Basic NeRF mlp
-            input_ch: int = 3,
-            input_ch_views: int = 3,
-            output_ch: int = 4,
-            depth: int = 8,
-            layer_ch: int = 256,
-            skip: int = 4,
-            num_samples: list = [64,128],
-            num_levels: int = 2,
-            resample_padding: float = 0.01,
-            use_viewdir: bool = True,
-            use_viewdir_in_first_layer: bool = True,
-            white_bkgd: bool = True,
-            # Positional Encoder
-            use_posenc: bool = True,
-            posenc_ch: int = 10,
-            use_intergrate_posenc: bool = True,
-            use_viewdir_posenc: bool = True,
-            viewdir_posenc_ch: int = 4,
-            # Tenso Encoder
-            use_tenso: bool = True,
-            tenso_aabb: torch.Tensor =  torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
-            tenso_resolution: int = 256,
-            tenso_color_ch: int = 8,
-            tenso_app_ch: int = 8,
-            tenso_dense_ch: int = 8,
+            aabb: torch.Tensor =  torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
+            resolution: int = 256,
+            dense_ch: int = 8,
+            color_ch: int = 8,
+            app_ch: int = 27,
+            use_ipe: bool = True,
             ipe_tol: int = 3,
-            ipe_sampling_factor: int = 2,
-            # Forward
-            return_raw: bool = False,
+            ipe_factor: int = 2,
         ) -> None:
         super().__init__()
 
         self.device = device
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
-        self.output_ch = output_ch
-        self.depth = depth
-        self.layer_ch = layer_ch
-        self.skip = skip
-        self.num_samples = num_samples
-        self.num_levels = num_levels
-        self.resample_padding = resample_padding
-        self.use_viewdir = use_viewdir
-        self.use_viewdir_in_first_layer = use_viewdir_in_first_layer if use_viewdir else False
-        self.use_viewdir_pe = use_viewdir_posenc if use_viewdir else False
-        self.viewdir_pe_ch = viewdir_posenc_ch
-        self.use_pe = use_posenc
-        self.use_ipe = use_intergrate_posenc
-        self.pe_ch = posenc_ch
-        self.use_tenso = use_tenso
-        self.tenso_res = tenso_resolution
-        self.tenso_aabb = tenso_aabb.to(self.device)
-        self.color_ch = tenso_color_ch
-        self.app_ch = tenso_app_ch
-        self.dense_ch = tenso_dense_ch
+        self.aabb = aabb.to(self.device)
+        self.resolution = resolution
+        self.dense_ch = dense_ch
+        self.color_ch = color_ch
+        self.app_ch = app_ch
+        self.use_ipe = use_ipe
         self.ipe_tol = ipe_tol
-        self.ipe_factor = ipe_sampling_factor
-        self.white_bkgd = white_bkgd
-        self.return_raw = return_raw
+        self.ipe_factor = ipe_factor
 
-        # Check if network need tenso decomposition
-        if self.use_tenso:
-            # Creating VM decomposition parameters - Vectors
-            self.color_vector_x = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, 1) * 0.1
+        # Creating VM decomposition parameters - Vectors
+        self.color_vector_x = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+        ).to(self.device)
+        self.color_vector_y = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+        ).to(self.device)
+        self.color_vector_z = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+        ).to(self.device)
+        if not self.dense_ch == 0:
+            self.dense_vector_x = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
             ).to(self.device)
-            self.color_vector_y = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, 1) * 0.1
+            self.dense_vector_y = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
             ).to(self.device)
-            self.color_vector_z = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, 1) * 0.1
+            self.dense_vector_z = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
             ).to(self.device)
-            if not self.dense_ch == 0:
-                self.dense_vector_x = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, 1) * 0.1
-                ).to(self.device)
-                self.dense_vector_y = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, 1) * 0.1
-                ).to(self.device)
-                self.dense_vector_z = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, 1) * 0.1
-                ).to(self.device)
-            else:
-                self.dense_vector_x = self.color_vector_x
-                self.dense_vector_y = self.color_vector_y
-                self.dense_vector_z = self.color_vector_z
-            # Creating VM decomposition parameters - Matrix
-            self.color_plane_yz = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, self.tenso_res) * 0.1
-            ).to(self.device)
-            self.color_plane_zx = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, self.tenso_res) * 0.1
-            ).to(self.device)
-            self.color_plane_xy = nn.Parameter(
-                torch.randn(1, self.color_ch, self.tenso_res, self.tenso_res) * 0.1
-            ).to(self.device)
-            if not self.dense_ch == 0:
-                self.dense_plane_yz = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, self.tenso_res) * 0.1
-                ).to(self.device)
-                self.dense_plane_zx = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, self.tenso_res) * 0.1
-                ).to(self.device)
-                self.dense_plane_xy = nn.Parameter(
-                    torch.randn(1, self.dense_ch, self.tenso_res, self.tenso_res) * 0.1
-                ).to(self.device)
-            else:
-                self.dense_plane_yz = self.color_plane_yz
-                self.dense_plane_zx = self.color_plane_zx
-                self.dense_plane_xy = self.color_plane_xy
-                self.dense_ch = self.color_ch
-            self.color_basis = nn.Linear(3*self.color_ch, self.app_ch, bias=False).to(self.device)
-        # Check if network need pe/ipe
-        if self.use_pe:
-            self.positional_encoding = PositionalEncoding(
-                min_deg=0,
-                max_deg=self.pe_ch
-            ).to(self.device)
-            self.pe_ch = self.input_ch * self.pe_ch * 2
-
-            # If using ipe and tenso both, pre compute the gaussian weight to fetching from feature map
-            if self.use_ipe and self.use_tenso:
-                self.vector_weight, vector_shift = create_standard_1d_gaussian_weight_map(
-                    self.ipe_tol, self.ipe_factor
-                )
-                self.plane_weight, plane_shift_x, plane_shift_y = create_standard_2d_gaussian_weight_map(
-                    self.ipe_tol, self.ipe_factor
-                )
-                self.vector_weight = torch.tensor(self.vector_weight).unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(self.device) # [1, 1, N, 1]
-                vector_shift = torch.tensor(vector_shift, dtype=torch.float32)
-                vector_shift_x, vector_shift_y = torch.meshgrid([vector_shift, torch.tensor(1, dtype=torch.float32)], indexing='ij')
-                vector_shift_x = vector_shift_x.unsqueeze(-1)
-                vector_shift_y = vector_shift_y.unsqueeze(-1)
-                self.vector_shift = torch.cat([vector_shift_x,vector_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, N, 1, 2]
-                self.plane_weight = torch.tensor(self.plane_weight).unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, Nx, Ny]
-                plane_shift_x = torch.tensor(plane_shift_x, dtype=torch.float32)
-                plane_shift_y = torch.tensor(plane_shift_y, dtype=torch.float32)
-                plane_shift_x = plane_shift_x.unsqueeze(-1)
-                plane_shift_y = plane_shift_y.unsqueeze(-1)
-                self.plane_shift = torch.cat([plane_shift_x,plane_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, Nx, Ny, 2]
-        # Check if network need viewdir and viewdir_pe
-        if self.use_viewdir:
-            self.viewdir_ch = 3
-            if self.use_viewdir_pe:
-                self.viewdir_pe = PositionalEncoding(
-                    min_deg=0,
-                    max_deg=self.viewdir_pe_ch
-                ).to(self.device)
-                self.viewdir_ch = self.viewdir_ch * self.viewdir_pe_ch * 2
-        # Calculate input channel
-        self.mlp_input_ch = 0
-        if self.use_tenso:
-            self.mlp_input_ch = self.mlp_input_ch + self.app_ch 
-        if self.use_pe:
-            self.mlp_input_ch = self.mlp_input_ch + self.pe_ch
-        if self.use_viewdir_in_first_layer:
-            self.mlp_input_ch = self.mlp_input_ch + self.viewdir_ch
-        if self.mlp_input_ch == 0:
-            self.mlp_input_ch = 3
-
-        # If using regular NeRF, create MLP network
-        if not self.use_tenso:
-            self.mlp_list = []
-            for index in range(self.depth):
-                if index == 0:
-                    self.mlp_list.append(nn.Sequential(nn.Linear(self.mlp_input_ch, self.layer_ch), nn.ReLU(True)).to(self.device))
-                elif index == self.skip:
-                    self.mlp_skip_ch = self.layer_ch
-                    if self.use_tenso:
-                        self.mlp_skip_ch = self.mlp_skip_ch + self.app_ch 
-                    if self.use_pe:
-                        self.mlp_skip_ch = self.mlp_skip_ch + self.pe_ch
-                    if self.use_viewdir_pe:
-                        self.mlp_skip_ch = self.mlp_skip_ch + self.viewdir_ch
-                    self.mlp_list.append(nn.Sequential(nn.Linear(self.mlp_skip_ch, self.layer_ch), nn.ReLU(True)).to(self.device))
-                else:
-                    self.mlp_list.append(nn.Sequential(nn.Linear(self.layer_ch, self.layer_ch), nn.ReLU(True)).to(self.device))
-
-        # In tenso, density directly comput by sum
-        # In other NeRF, density out by one layer
-        if not self.use_tenso:
-            if self.use_viewdir:
-                self.density_out = nn.Linear(self.layer_ch + self.viewdir_ch, 1).to(self.device)
-                self.color_out = nn.Sequential(
-                    nn.Linear(self.layer_ch + self.viewdir_ch, self.layer_ch//2),
-                    nn.ReLU(),
-                    nn.Linear(self.layer_ch // 2, 3),
-                ).to(self.device)
-            else:
-                self.density_out = nn.Linear(self.layer_ch, 1).to(self.device)
-                self.color_out = nn.Sequential(
-                    nn.Linear(self.layer_ch, self.layer_ch//2),
-                    nn.ReLU(),
-                    nn.Linear(self.layer_ch // 2, 3),
-                ).to(self.device)
         else:
-            self.color_input_ch = self.mlp_input_ch
-            self.color_out = nn.Sequential(
-                nn.Linear(self.color_input_ch, self.layer_ch),
-                nn.Linear(self.layer_ch, self.layer_ch),
-                nn.Linear(self.layer_ch, 3),
-                ).to(self.device)
+            self.dense_vector_x = self.color_vector_x
+            self.dense_vector_y = self.color_vector_y
+            self.dense_vector_z = self.color_vector_z
+        # Creating VM decomposition parameters - Matrix
+        self.color_plane_yz = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+        ).to(self.device)
+        self.color_plane_zx = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+        ).to(self.device)
+        self.color_plane_xy = nn.Parameter(
+            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+        ).to(self.device)
+        if not self.dense_ch == 0:
+            self.dense_plane_yz = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+            ).to(self.device)
+            self.dense_plane_zx = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+            ).to(self.device)
+            self.dense_plane_xy = nn.Parameter(
+                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+            ).to(self.device)
+        else:
+            self.dense_plane_yz = self.color_plane_yz
+            self.dense_plane_zx = self.color_plane_zx
+            self.dense_plane_xy = self.color_plane_xy
+            self.dense_ch = self.color_ch
+        self.color_basis = nn.Linear(3*self.color_ch, self.app_ch, bias=False).to(self.device)
 
-        self.density_ReLU = nn.ReLU(True)
-        self.color_Sigmoid = nn.Sigmoid()
-
+        # If using ipe, pre compute the gaussian weight to fetching from feature map
+        if self.use_ipe:
+            self.vector_weight, vector_shift = create_standard_1d_gaussian_weight_map(
+                self.ipe_tol, self.ipe_factor
+            )
+            self.plane_weight, plane_shift_x, plane_shift_y = create_standard_2d_gaussian_weight_map(
+                self.ipe_tol, self.ipe_factor
+            )
+            self.vector_weight = torch.tensor(self.vector_weight).unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(self.device) # [1, 1, N, 1]
+            vector_shift = torch.tensor(vector_shift, dtype=torch.float32)
+            vector_shift_x, vector_shift_y = torch.meshgrid([vector_shift, torch.tensor(1, dtype=torch.float32)], indexing='ij')
+            vector_shift_x = vector_shift_x.unsqueeze(-1)
+            vector_shift_y = vector_shift_y.unsqueeze(-1)
+            self.vector_shift = torch.cat([vector_shift_x,vector_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, N, 1, 2]
+            self.plane_weight = torch.tensor(self.plane_weight).unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, Nx, Ny]
+            plane_shift_x = torch.tensor(plane_shift_x, dtype=torch.float32)
+            plane_shift_y = torch.tensor(plane_shift_y, dtype=torch.float32)
+            plane_shift_x = plane_shift_x.unsqueeze(-1)
+            plane_shift_y = plane_shift_y.unsqueeze(-1)
+            self.plane_shift = torch.cat([plane_shift_x,plane_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, Nx, Ny, 2]
+    
     def _bilinear_grid(self, image: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -377,9 +270,9 @@ class MultiNeRF(nn.Module):
     def _get_features(self, xyz: torch.Tensor, var: Optional[torch.Tensor] = None, param_type: str = 'density', method: str = 'sum'):
         B = xyz.shape[0]
         # xyz: [B, 3]; var: [B, 3]
-        rescale_ratio = (self.tenso_aabb[0,:] - self.tenso_aabb[1,:]) * (self.tenso_res - 1)
+        rescale_ratio = (self.aabb[0,:] - self.aabb[1,:]) * (self.resolution - 1)
         # Remap XYZ and VAR to the Parameter Region
-        xyz = (xyz - self.tenso_aabb[0,:]) * rescale_ratio
+        xyz = (xyz - self.aabb[0,:]) * rescale_ratio
 
         coefs = []
         if param_type == 'density':
@@ -449,6 +342,281 @@ class MultiNeRF(nn.Module):
     def _get_color_features(self, xyz: torch.Tensor, var: Optional[torch.Tensor]):
         return self._get_features(xyz, var, 'color', 'multiply')
         
+    def forward(self, xyz: torch.Tensor, var: torch.Tensor):
+        sigma = self._get_density_features(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
+        rgb_feature = self._get_color_features(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
+        return sigma, rgb_feature
+                
+"""
+    MLP network for tensoRF with IPE compatible
+    If forward function contain position variance, IPE will be automatically processed.
+"""
+class TensoMLP_PE(nn.Module):
+    def __init__(
+            self,
+            device: str = 'cpu',
+            color_in_ch: int = 27,
+            feature_ch: int = 128,
+            pos_pe_dim: int = 10,
+            view_pe_dim: int = 4,
+            ) -> None:
+        super().__init__()
+        
+        self.device = device
+        self.color_in_ch = color_in_ch
+        self.feature_ch = feature_ch
+        self.pos_pe_dim = pos_pe_dim
+        self.view_pe_dim = view_pe_dim
+
+        self.mlp_input_ch = self.color_in_ch
+
+        if not self.pos_pe_dim == 0:
+            self.pos_pe = PositionalEncoding(
+                min_deg=0,
+                max_deg=self.pos_pe_dim,
+                ).to(self.device)
+            self.mlp_input_ch = self.mlp_input_ch + 3*2*self.pos_pe_dim
+        else:
+            self.pos_pe = nn.Identity().to(self.device)
+            self.mlp_input_ch = self.mlp_input_ch + 3
+
+        if not self.view_pe_dim == 0:
+            self.view_pe = PositionalEncoding(
+                min_deg=0,
+                max_deg=self.view_pe_dim,
+                ).to(self.device)
+            self.mlp_input_ch = self.mlp_input_ch + 3*2*self.view_pe_dim
+        else:
+            self.view_pe = nn.Identity().to(self.device)
+            self.mlp_input_ch = self.mlp_input_ch + 3
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(self.mlp_input_ch, self.feature_ch),
+            nn.ReLU(True),
+            nn.Linear(self.feature_ch, self.feature_ch),
+            nn.ReLU(True),
+            nn.Linear(self.feature_ch, 3),
+            ).to(self.device)
+    
+    def forward(
+            self, 
+            color_feature: torch.Tensor,
+            viewdir: torch.Tensor,
+            position: torch.Tensor,
+            position_var: Optional[torch.Tensor] = None,
+            ):
+        
+        pos_enc = self.pos_pe(position.to(self.device), position_var.to(self.device) if position_var is not None else None)[0]
+        view_enc = self.view_pe(viewdir.to(self.device), None)[0]
+        input = torch.cat([color_feature.to(self.device), pos_enc, view_enc], dim=-1)
+        out = self.mlp(input)
+
+        return out
+
+"""
+    TensorRF implementation from oritinal paper using VM decomp
+    Input: position, variance
+    Output: rgb, sigma
+    Compatible for volumetric_rendering
+"""
+class TensorRF(nn.Module):
+    def __init__(
+            self,
+            device: str = 'cpu',
+            aabb: torch.Tensor =  torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
+            resolution: int = 128,
+            dense_ch: int = 8,
+            color_ch: int = 8,
+            app_ch: int = 27,
+            ipe_tol: int = 3,
+            ipe_factor: int = 2,
+            position_pe_dim: int = 10,
+            viewdir_pe_dim: int = 4,
+            mlp_color_feature: int = 128,
+        ) -> None:
+        super().__init__()
+        
+        self.device = device
+        self.aabb = aabb.to(self.device)
+        self.res = resolution
+        self.dense_ch = dense_ch
+        self.color_ch = color_ch
+        self.app_ch = app_ch
+        self.ipe_tol = ipe_tol
+        self.ipe_factor = ipe_factor
+        self.position_pe_dim = position_pe_dim
+        self.viewdir_pe_dim = viewdir_pe_dim
+        self.mlp_color_feature = mlp_color_feature
+
+        self.tensoVMModel = TensorVMBase(
+            device=self.device,
+            aabb=self.aabb,
+            resolution=self.res,
+            dense_ch=self.dense_ch,
+            color_ch=self.color_ch,
+            app_ch=self.app_ch,
+            ipe_tol=self.ipe_tol,
+            ipe_factor=self.ipe_factor,
+        ).to(self.device)
+
+        self.tensoColorMlp = TensoMLP_PE(
+            device=self.device,
+            color_in_ch=self.app_ch,
+            feature_ch=self.mlp_color_feature,
+            pos_pe_dim=self.position_pe_dim,
+            view_pe_dim=self.viewdir_pe_dim,
+            ).to(self.device)
+        
+        self.density_ReLU = nn.ReLU(True).to(self.device)
+        self.color_Sigmoid = nn.Sigmoid().to(self.device)
+        
+    def forward(self, viewdir: torch.Tensor, xyz: torch.Tensor, var: Optional[torch.Tensor] = None):
+        sigma, rgb_feature = self.tensoVMModel(xyz.to(self.device), var.to(self.device) if var is not None else None)
+        rgb = self.tensoColorMlp(rgb_feature, viewdir.to(self.device), xyz.to(self.device), var.to(self.device) if var is not None else None)
+        sigma = self.density_ReLU(sigma)
+        rgb = self.color_Sigmoid(rgb)
+        return sigma, rgb
+
+"""
+    NeRF_MLP
+    For normal MLP network for NeRF and Mip-NeRF
+"""
+class NeRF_MLP(nn.Module):
+    def __init__(
+            self,
+            device: str = 'cpu',
+            input_ch: int = 3,
+            depth: int = 8,
+            skip: list[int] = [4],
+            hidden: int = 256,
+            ) -> None:
+        super().__init__()
+
+        self.device = device
+        self.input_ch = input_ch
+        self.depth = depth
+        self.skip = skip
+        self.hidden = hidden
+
+        self.mlp = []
+        self.mlp.append(nn.Sequential(
+            nn.Linear(self.input_ch, self.hidden),
+            nn.ReLU()).to(self.device))
+        for layer in range(1, self.depth):
+            if layer in self.skip:
+                self.mlp.append(nn.Sequential(
+                    nn.Linear(self.hidden + self.input_ch, self.hidden),
+                    nn.ReLU()).to(self.device))
+            else:
+                self.mlp.append(nn.Sequential(
+                    nn.Linear(self.hidden, self.hidden),
+                    nn.ReLU()).to(self.device))
+
+    def forward(self, input_feature):
+        hidden = self.mlp[0](input_feature.to(self.device))
+        for layer in range(1, self.depth):
+            if layer in self.skip:
+                hidden_input = torch.cat([hidden, input_feature], dim=-1)
+                hidden = self.mlp[layer](hidden_input)
+            else:
+                hidden = self.mlp[layer](hidden)
+        return hidden
+
+"""
+    NeRF Network compatible with Mip-NeRF
+    If forward function contain position variance, IPE will be automatically processed.
+"""
+class NeRF_Mip(nn.Module):
+    def __init__(
+            self,
+            device: str = 'cpu',
+            pos_pe_dim: int = 10,
+            view_pe_dim: int = 4,
+            depth: int = 8,
+            skip: list[int] = [4],
+            hidden: int = 256,
+            use_viewdir: bool = True,
+            use_ipe: bool = True,
+        ) -> None:
+        super().__init__()
+
+        self.device = device
+        self.pos_pe_dim = pos_pe_dim
+        self.view_pe_dim = view_pe_dim
+        self.depth = depth
+        self.skip = skip
+        self.hidden = hidden
+        self.use_viewdir = use_viewdir
+        self.use_ipe = use_ipe
+
+        self.pos_pe = PositionalEncoding(
+            min_deg=0,
+            max_deg=self.pos_pe_dim).to(self.device)
+        self.mlp = NeRF_MLP(
+            device=self.device,
+            input_ch=3*2*self.pos_pe_dim,
+            depth=8,
+            skip=[4],
+            hidden=self.hidden).to(self.device)
+
+        self.dense_out = nn.Linear(self.hidden, 1).to(self.device)
+        if self.use_viewdir:
+            self.view_pe = PositionalEncoding(
+                min_deg=0,
+                max_deg=self.view_pe_dim).to(self.device)
+            self.rgb_out = nn.Sequential(
+                nn.Linear(self.hidden+3*2*self.view_pe_dim, self.hidden//2),
+                nn.ReLU(),
+                nn.Linear(self.hidden // 2, 3)).to(self.device)
+        else:
+            self.rgb_out = nn.Linear(self.hidden, 3).to(self.device)
+        
+        self.density_ReLU = nn.ReLU(True).to(self.device)
+        self.color_Sigmoid = nn.Sigmoid().to(self.device)
+    
+    def forward(self, dir: torch.Tensor, xyz: torch.Tensor, var: torch.Tensor):
+        pos_enc = self.pos_pe(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)[0]
+        mlp_out = self.mlp(pos_enc)
+
+        sigma = self.dense_out(mlp_out)
+        if self.use_viewdir:
+            view_enc = self.view_pe(dir.to(self.device), None)[0]
+            rgb_input = torch.cat([mlp_out, view_enc], dim=-1)
+            rgb = self.rgb_out(rgb_input)
+        else:
+            rgb = self.rgb_out(mlp_out)
+        
+        sigma = self.density_ReLU(sigma)
+        rgb = self.color_Sigmoid(rgb)
+
+        return sigma, rgb
+        
+"""
+    Main Backbone for ray rendering for NeRF
+"""
+class RayRendering(nn.Module):
+    def __init__(
+            self,
+            model: nn.Module,
+            device: str = 'cpu',
+            num_samples: list = [64,128],
+            num_levels: int = 2,
+            resample_padding: float = 0.01,
+            rgb_padding: float = 0.001,
+            white_bkgd: bool = True,
+            return_raw: bool = False,
+        ) -> None:
+        super().__init__()
+
+        self.device = device
+        self.model = model.to(device)
+        self.num_samples = num_samples
+        self.num_levels = num_levels
+        self.resample_padding = resample_padding
+        self.rgb_padding = rgb_padding
+        self.white_bkgd = white_bkgd
+        self.return_raw = return_raw
+        
     def forward(self, rays_data: torch.Tensor):
 
         comp_rgbs = []
@@ -481,52 +649,13 @@ class MultiNeRF(nn.Module):
                                                           ray_shape='cone')
             mean = mean.view(B*self.num_samples[l], 3).to(self.device)
             var = var.view(B*self.num_samples[l], 3).to(self.device)
-
-            # If not use IPE, change var to None to avoid it.
-            if self.use_pe:
-                if not self.use_ipe:
-                    var = None
-                samples_enc = self.positional_encoding(mean, var)[0] # [B*S, PE_CH]
-            else:
-                samples_enc = mean # [B*S, 3]
-
-            # Compute view enc if use view_dir
-            if self.use_viewdir:
-                view_dirs = rays_directions.unsqueeze(1).repeat(1,self.num_samples[l],1).view(B*self.num_samples[l],3)
-                if self.use_viewdir_pe:
-                    view_enc = self.viewdir_pe(view_dirs, None)[0]
-                else:
-                    view_enc = view_dirs
-
-            # If use tenso, gather feature using interpolation and weighted intergration
-            if self.use_tenso:
-                sigma = self._get_density_features(mean, var)
-                rgb_feature = self._get_color_features(mean, var)
-                samples_enc = torch.cat([samples_enc,rgb_feature], dim=-1) # [B, PE_CH+APP_CH]
-                if self.use_viewdir:
-                    samples_enc = torch.cat([samples_enc,view_enc], dim=-1) # [B, PE_CH+APP_CH+V_CH]
-                rgb = self.color_out(samples_enc)
-            # If use regular NeRF
-            else:
-                if self.use_viewdir_in_first_layer:
-                    samples_enc = torch.cat([samples_enc,view_enc], dim=-1) # [B, PE_CH+APP_CH+V_CH]
-            
-                # Main MLP network
-                hidden = self.mlp_list[0](samples_enc)
-                for layer in range(1, self.depth):
-                    if layer == self.skip:
-                        skip_input = torch.cat([hidden, samples_enc], dim=-1)
-                        hidden = self.mlp_list[layer](skip_input)
-                    else:
-                        hidden = self.mlp_list[layer](hidden)
-            
-                if self.use_viewdir:
-                    final_input = torch.cat([hidden, view_enc], dim=-1)
-                    sigma = self.density_out(final_input)
-                    rgb = self.color_out(final_input)
-
-            sigma = self.density_ReLU(sigma).view(B, self.num_samples[l], 1)
-            rgb = self.color_Sigmoid(rgb).view(B, self.num_samples[l], 3)
+            dirs = rays_directions.unsqueeze(1).expand(B,self.num_samples[l],3).reshape(B*self.num_samples[l],3).to(self.device)
+            # Run model
+            sigma, rgb = self.model(dirs, mean, var)
+            # Rendering
+            rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+            sigma = sigma.view(B, self.num_samples[l], 1)
+            rgb = rgb.view(B, self.num_samples[l], 3)
             comp_rgb, distance, acc, weights, alpha = volumetric_rendering(rgb, sigma, t_vals, rays_directions, self.white_bkgd)
             comp_rgbs.append(comp_rgb)
             distances.append(distance)
@@ -539,174 +668,290 @@ class MultiNeRF(nn.Module):
         else:
             # Predicted RGB values for rays, Disparity map (inverse of depth), Accumulated opacity (alpha) along a ray
             return torch.stack(comp_rgbs), torch.stack(distances), torch.stack(accs)
-
-if __name__ == "__main__":
-    import time
         
-    # 测试配置参数
-    BATCH_SIZE = 1024  # 批量大小
-    NUM_SAMPLES = [64, 128]  # 采样点数
-    device = 'mps'
+if __name__ == "__main__":
+    import torch
+    import numpy as np
     
-    # 创建模型实例
-    print("\nCreating MultiNeRF model...")
-    model = MultiNeRF(
+    # 设置随机种子以保证可重复性
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 设备设置
+    device = 'mps'
+    print(f"Using device: {device}")
+    
+    # 测试配置
+    batch_size = 2
+    num_rays = 4
+    num_samples_coarse = 8
+    num_samples_fine = 16
+    
+    # 创建模拟的光线数据
+    def create_mock_rays_data(num_rays, device='cpu'):
+        """创建模拟的光线数据"""
+        rays_data = torch.zeros(num_rays, 12, device=device)
+        
+        # 光线起点 (origins)
+        rays_data[:, 0:3] = torch.randn(num_rays, 3) * 0.1
+        
+        # 光线方向 (directions) - 归一化
+        dirs = torch.randn(num_rays, 3)
+        rays_data[:, 3:6] = dirs / torch.norm(dirs, dim=1, keepdim=True)
+        
+        # 光线颜色 (rgb) - 可选，在训练中使用
+        rays_data[:, 6:9] = torch.rand(num_rays, 3)
+        
+        # 光线半径 (radii) - MipNeRF中使用
+        rays_data[:, 9] = torch.rand(num_rays) * 0.01 + 0.001
+        
+        # 近平面和远平面
+        rays_data[:, 10] = torch.rand(num_rays) * 0.5 + 0.5  # near: 0.5-1.0
+        rays_data[:, 11] = torch.rand(num_rays) * 2.0 + 3.0  # far: 3.0-5.0
+        
+        return rays_data
+    
+    # 创建测试数据
+    test_rays = create_mock_rays_data(num_rays, device)
+    print(f"Test rays shape: {test_rays.shape}")
+    
+    # 测试1: TensorRF模型
+    print("\n" + "="*60)
+    print("Testing TensorRF Model")
+    print("="*60)
+    
+    tensorrf_model = TensorRF(
         device=device,
-        input_ch=3,
-        input_ch_views=3,
-        output_ch=4,
-        depth=4,
-        layer_ch=256,
-        skip=2,
-        num_samples=NUM_SAMPLES,
+        aabb=torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]]),
+        resolution=128,
+        dense_ch=8,
+        color_ch=8,
+        app_ch=27,
+        ipe_tol=3,
+        ipe_factor=2,
+        position_pe_dim=10,
+        viewdir_pe_dim=4,
+        mlp_color_feature=128,
+    )
+    
+    # 创建渲染器
+    tensorrf_renderer = RayRendering(
+        model=tensorrf_model,
+        device=device,
+        num_samples=[num_samples_coarse, num_samples_fine],
         num_levels=2,
         resample_padding=0.01,
-        use_viewdir=True,
+        rgb_padding=0.001,
         white_bkgd=True,
-        use_posenc=True,
-        posenc_ch=10,
-        use_intergrate_posenc=True,
-        use_viewdir_posenc=True,
-        viewdir_posenc_ch=4,
-        use_tenso=True,
-        tenso_aabb=torch.tensor([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
-        tenso_resolution=128,  # 使用较小分辨率以加快测试
-        tenso_color_ch=8,
-        tenso_app_ch=8,
-        tenso_dense_ch=8,
-        ipe_tol=2,  # 使用较小的容忍度以加快测试
-        ipe_sampling_factor=2,
         return_raw=True,
     )
     
-    # 打印模型参数数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # 创建模拟的rays_data
-    # 数据格式: [origins(3), directions(3), viewdirs(3), rgb(3), radius(1), near(1), far(1)]
-    print("\nCreating test data...")
-    rays_data = torch.randn(BATCH_SIZE, 12).to(device)
-    
-    # 设置合理的值范围
-    rays_data[:, 9] = 0.01  # radius
-    rays_data[:, 10] = 0.1  # near
-    rays_data[:, 11] = 10.0  # far
-    
-    # 归一化方向向量
-    rays_directions = rays_data[:, 3:6]
-    rays_directions = F.normalize(rays_directions, dim=-1)
-    rays_data[:, 3:6] = rays_directions
-    
-
     # 测试前向传播
-    print("\nTesting forward pass...")
-    
-    # 计时前向传播
-    start_time = time.time()
-    
+    tensorrf_renderer.eval()
     with torch.no_grad():
-        comp_rgbs, distances, accs, raws = model(rays_data)
+        comp_rgbs, distances, accs, raws = tensorrf_renderer(test_rays)
+        
+    print(f"TensorRF Output shapes:")
+    print(f"  Coarse RGB: {comp_rgbs[0].shape}")
+    print(f"  Fine RGB: {comp_rgbs[1].shape}")
+    print(f"  Distances: {distances.shape}")
+    print(f"  Accs: {accs.shape}")
+    print(f"  Raw outputs: {raws.shape}")
+    print(f"  RGB range: [{comp_rgbs[0].min():.3f}, {comp_rgbs[0].max():.3f}]")
+    print(f"  Density range: [{raws[:, -1].min():.3f}, {raws[:, -1].max():.3f}]")
+    
+    # 测试模型直接调用
+    test_xyz = torch.randn(10, 3, device=device) * 0.5
+    test_var = torch.rand(10, 3, device=device) * 0.01
+    test_viewdir = torch.randn(10, 3, device=device)
+    test_viewdir = test_viewdir / torch.norm(test_viewdir, dim=1, keepdim=True)
+    
+    sigma, rgb = tensorrf_model(test_viewdir, test_xyz, test_var)
+    print(f"Direct model call:")
+    print(f"  Sigma shape: {sigma.shape}, mean: {sigma.mean().item():.4f}")
+    print(f"  RGB shape: {rgb.shape}, mean: {rgb.mean().item():.4f}")
+    
+    print("✓ TensorRF test passed!")
+            
+    # 测试2: MipNeRF模型
+    print("\n" + "="*60)
+    print("Testing MipNeRF Model")
+    print("="*60)
+    
+    mipnerf_model = NeRF_Mip(
+        device=device,
+        pos_pe_dim=10,
+        view_pe_dim=4,
+        depth=8,
+        skip=[4],
+        hidden=256,
+        use_viewdir=True,
+        use_ipe=True,  # MipNeRF使用IPE
+    )
+    
+    # 创建渲染器
+    mipnerf_renderer = RayRendering(
+        model=mipnerf_model,
+        device=device,
+        num_samples=[num_samples_coarse, num_samples_fine],
+        num_levels=2,
+        resample_padding=0.01,
+        rgb_padding=0.001,
+        white_bkgd=True,
+        return_raw=False,
+    )
+    
+    # 测试前向传播
+    mipnerf_renderer.eval()
+    with torch.no_grad():
+        comp_rgbs, distances, accs = mipnerf_renderer(test_rays)
+        
+    print(f"MipNeRF Output shapes:")
+    print(f"  Coarse RGB: {comp_rgbs[0].shape}")
+    print(f"  Fine RGB: {comp_rgbs[1].shape}")
+    print(f"  Distances: {distances.shape}")
+    print(f"  Accs: {accs.shape}")
+    print(f"  RGB range: [{comp_rgbs[0].min():.3f}, {comp_rgbs[0].max():.3f}]")
+    
+    # 测试模型直接调用
+    sigma, rgb = mipnerf_model(test_viewdir, test_xyz, test_var)
+    print(f"Direct model call:")
+    print(f"  Sigma shape: {sigma.shape}, mean: {sigma.mean().item():.4f}")
+    print(f"  RGB shape: {rgb.shape}, mean: {rgb.mean().item():.4f}")
+    
+    print("✓ MipNeRF test passed!")
+    
+    # 测试3: 原始NeRF模型
+    print("\n" + "="*60)
+    print("Testing Original NeRF Model")
+    print("="*60)
+    
+    nerf_model = NeRF_Mip(
+        device=device,
+        pos_pe_dim=10,
+        view_pe_dim=4,
+        depth=8,
+        skip=[4],
+        hidden=256,
+        use_viewdir=True,
+        use_ipe=False,  # 原始NeRF不使用IPE
+    )
+    
+    # 创建渲染器 - 原始NeRF通常只有一层
+    nerf_renderer = RayRendering(
+        model=nerf_model,
+        device=device,
+        num_samples=[num_samples_coarse],  # 只有粗采样
+        num_levels=1,  # 只有一层
+        resample_padding=0.01,
+        rgb_padding=0.001,
+        white_bkgd=True,
+        return_raw=True,
+    )
+    
+    # 测试前向传播
+    nerf_renderer.eval()
+    with torch.no_grad():
+        comp_rgbs, distances, accs, raws = nerf_renderer(test_rays)
+        
+    print(f"NeRF Output shapes:")
+    print(f"  RGB: {comp_rgbs[0].shape}")
+    print(f"  Distances: {distances.shape}")
+    print(f"  Accs: {accs.shape}")
+    print(f"  Raw outputs: {raws.shape}")
+    print(f"  RGB range: [{comp_rgbs[0].min():.3f}, {comp_rgbs[0].max():.3f}]")
+    
+    # 测试模型直接调用（无方差）
+    sigma, rgb = nerf_model(test_viewdir, test_xyz, None)
+    print(f"Direct model call (no variance):")
+    print(f"  Sigma shape: {sigma.shape}, mean: {sigma.mean().item():.4f}")
+    print(f"  RGB shape: {rgb.shape}, mean: {rgb.mean().item():.4f}")
+    
+    print("✓ NeRF test passed!")
+        
+    # 测试4: 性能基准测试
+    print("\n" + "="*60)
+    print("Performance Benchmark")
+    print("="*60)
     
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        # 创建更大的测试数据
+        large_rays = create_mock_rays_data(1024, device)
+        
+        models_to_test = [
+            ("TensorRF", tensorrf_renderer),
+            ("MipNeRF", mipnerf_renderer),
+            ("NeRF", nerf_renderer),
+        ]
+        
+        for model_name, renderer in models_to_test:
+            renderer.eval()
+            
+            # 预热
+            with torch.no_grad():
+                _ = renderer(large_rays[:16])
+            
+            # 性能测试
+            torch.cuda.synchronize()
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            
+            start_time.record() # type: ignore
+            with torch.no_grad():
+                for i in range(0, 1024, 64):
+                    batch = large_rays[i:i+64]
+                    _ = renderer(batch)
+            end_time.record() # type: ignore
+            torch.cuda.synchronize()
+            
+            elapsed_time = start_time.elapsed_time(end_time)
+            print(f"{model_name}: {elapsed_time:.1f} ms for 1024 rays")
     
-    elapsed_time = time.time() - start_time
-
-    # 检查输出形状
-    print(f"\nForward pass completed in {elapsed_time*1000:.2f} ms")
-    print(f"Output shapes:")
-    print(f"  comp_rgbs: {comp_rgbs.shape}")  # 应该为 [num_levels, BATCH_SIZE, 3]
-    print(f"  distances: {distances.shape}")  # 应该为 [num_levels, BATCH_SIZE]
-    print(f"  accs: {accs.shape}")           # 应该为 [num_levels, BATCH_SIZE]
-    print(f"  raws: {raws.shape}")           # 应该为 [BATCH_SIZE*num_samples, 4]
+    # 测试5: 梯度检查
+    print("\n" + "="*60)
+    print("Gradient Check")
+    print("="*60)
     
-    # 检查值范围
-    print(f"\nValue ranges:")
-    print(f"  comp_rgbs: [{comp_rgbs.min():.4f}, {comp_rgbs.max():.4f}] (should be [0, 1] for RGB)")
-    print(f"  distances: [{distances.min():.4f}, {distances.max():.4f}]")
-    print(f"  accs: [{accs.min():.4f}, {accs.max():.4f}] (should be [0, 1])")
-    print(f"  raws RGB: [{raws[:, :3].min():.4f}, {raws[:, :3].max():.4f}]")
-    print(f"  raws sigma: [{raws[:, 3].min():.4f}, {raws[:, 3].max():.4f}]")
-
-
-    # 测试梯度计算（训练模式）
-    print("\nTesting gradient computation...")
-    model.train()
-    rays_data.requires_grad_(True)
+    try:
+        # 创建一个小的训练场景
+        test_model = TensorRF(
+            device=device,
+            resolution=64,  # 使用较小的分辨率以加快测试
+            dense_ch=4,
+            color_ch=4,
+            app_ch=12,
+        )
+        
+        test_optimizer = torch.optim.Adam(test_model.parameters(), lr=1e-3)
+        loss_fn = torch.nn.MSELoss()
+        
+        # 前向传播
+        test_model.train()
+        sigma, rgb = test_model(test_viewdir, test_xyz, test_var)
+        
+        # 创建目标值
+        target_sigma = torch.randn_like(sigma) * 0.1 + 0.5
+        target_rgb = torch.rand_like(rgb)
+        
+        # 计算损失和梯度
+        loss = loss_fn(sigma, target_sigma) + loss_fn(rgb, target_rgb)
+        loss.backward()
+        
+        # 检查梯度
+        has_gradients = False
+        for name, param in test_model.named_parameters():
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                has_gradients = True
+                break
+        
+        if has_gradients:
+            print("✓ Gradients are flowing correctly")
+        else:
+            print("⚠ No gradients detected - check model architecture")
+            
+    except Exception as e:
+        print(f"✗ Gradient check failed: {e}")
     
-    # 计算损失并反向传播
-    comp_rgbs, distances, accs, raws = model(rays_data)
-    loss = comp_rgbs.mean()  # 简单的损失函数
-    loss.backward()
-    
-    # 检查梯度
-    has_gradients = False
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            has_gradients = True
-            grad_norm = param.grad.norm().item()
-            if "weight" in name or "bias" in name:
-                print(f"  {name}: gradient norm = {grad_norm:.6f}")
-            break
-    
-    if has_gradients:
-        print("✓ Gradients computed successfully")
-    else:
-        print("✗ No gradients computed")
-    
-    # 测试不同配置
-    print("\nTesting different configurations...")
-    
-    # 测试1: 不使用tenso
-    print("\n1. Testing without TensoRF...")
-    model = MultiNeRF(
-        device=device,
-        use_tenso=False,
-        use_posenc=True,
-        use_intergrate_posenc=False,
-        num_samples=[32, 64],  # 使用更少的采样点以加快测试
-    )
-    
-    with torch.no_grad():
-        comp_rgbs_nt, distances_nt, accs_nt = model(rays_data)
-    print(f"  Output shapes: {comp_rgbs_nt.shape}, {distances_nt.shape}, {accs_nt.shape}")
-    
-    # 测试2: 不使用位置编码
-    print("\n2. Testing without intergrated positional encoding...")
-    model = MultiNeRF(
-        device=device,
-        use_tenso=True,
-        use_posenc=True,
-        use_intergrate_posenc=False,
-        num_samples=[32, 64],
-    )
-    
-    with torch.no_grad():
-        comp_rgbs_npe, distances_npe, accs_npe = model(rays_data)
-    print(f"  Output shapes: {comp_rgbs_npe.shape}, {distances_npe.shape}, {accs_npe.shape}")
-    
-    # 测试3: 不使用视角方向
-    print("\n3. Testing without view directions...")
-    model = MultiNeRF(
-        device=device,
-        use_viewdir=False,
-        use_tenso=True,
-        num_samples=[32, 64],
-    )
-    
-    with torch.no_grad():
-        comp_rgbs_nv, distances_nv, accs_nv = model(rays_data)
-    print(f"  Output shapes: {comp_rgbs_nv.shape}, {distances_nv.shape}, {accs_nv.shape}")
-    
-    # 内存使用情况（如果可用）
-    if torch.cuda.is_available():
-        print(f"\nGPU Memory usage:")
-        print(f"  Allocated: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
-        print(f"  Cached: {torch.cuda.memory_reserved()/1024**2:.2f} MB")
-    
-    print("\n" + "="*50)
-    print("All tests completed successfully! ✓")
-    print("="*50)
+    print("\n" + "="*60)
+    print("All tests completed!")
+    print("="*60)
