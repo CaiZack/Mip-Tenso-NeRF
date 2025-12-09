@@ -1,0 +1,8 @@
+# Ignore data folder
+data/
+
+# Ignore vscode workspace
+Mip-Tenso-NeRF.code-workspace
+
+# Ignore all test files
+*.ipynb
