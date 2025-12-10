@@ -182,6 +182,7 @@ class NeRFDataset(Dataset):
             pass # Different camera captured image <---- TODO
         
         self.render_poses = render_poses
+        self.test_poses = poses[i_test]
         self.test_images = images[i_test]
         self.render_num = render_poses.shape[0]
         self.hwf = hwf

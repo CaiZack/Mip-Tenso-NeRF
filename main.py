@@ -68,7 +68,7 @@ class NeRF_Trainer():
         if self.loss_fn is None:
             self.loss_fn = F.mse_loss
 
-    def render(self, poses, hwf, K, near, far, step = None, images: Optional[np.ndarray] = None):
+    def render(self, poses, hwf, K, near, far, step = None, images: Optional[np.ndarray] = None, rand_sel: int = 1):
         # Managing files
         if step is not None:
             self.eval_log_file = os.path.join(self.output_dir, f'eval_{step}_log.txt')
@@ -81,6 +81,11 @@ class NeRF_Trainer():
         if images is not None:
             assert poses.shape[0] == images.shape[0], \
             f"Poses and images must be same in evaluation mode, get {poses.shape[0]} and {images.shape[0]}"
+            if rand_sel > 0:
+                np.random.default_rng(int(time.time() * 1000))
+                rand_index = np.random.randint(0, poses.shape[0], rand_sel)
+                images = images[rand_index]
+                poses = poses[rand_index]
 
         self.model.eval()
         
@@ -129,7 +134,7 @@ class NeRF_Trainer():
 
             with torch.no_grad():
                 comp_rgbs, _, _ = self.model(batch)
-            result_rgb[current_idx:next_idx] = comp_rgbs
+            result_rgb[current_idx:next_idx] = comp_rgbs[-1]
 
             pbar.update(next_idx - current_idx)
             current_idx = next_idx
@@ -160,9 +165,10 @@ class NeRF_Trainer():
             freme_name = os.path.join(self.eval_output_dir, f'{idx}.jpg')
             image = Image.fromarray(image).save(freme_name)
         
-        # Save video
-        video_name = os.path.join(self.eval_output_dir, f'video.mp4')
-        imageio.mimwrite(video_name, imageList, fps=30, quality=8)
+        # Save video if not test
+        if image is None:
+            video_name = os.path.join(self.eval_output_dir, f'video.mp4')
+            imageio.mimwrite(video_name, imageList, fps=30, quality=8)
         avg_mse = np.mean(mse_all)
         avg_psnr = np.mean(psnr_all)
         with open(self.eval_log_file, '+a') as file:
@@ -225,13 +231,22 @@ class NeRF_Trainer():
 
             if (step+1) % self.eval_step == 0:
                 self.render(
-                    self.dataset.render_poses, 
+                    self.dataset.test_poses, 
                     self.dataset.hwf, 
                     self.dataset.K, 
                     self.dataset.near, 
                     self.dataset.far, 
                     step, 
                     self.dataset.test_images)
+                self.render(
+                    self.dataset.render_poses,
+                    self.dataset.hwf, 
+                    self.dataset.K, 
+                    self.dataset.near, 
+                    self.dataset.far, 
+                    step,
+                    None
+                )
         
         model_dir = os.path.join(self.ckpt_dir, f'{self.name}-Last-ckpt.pth')
         torch.save(self.model, model_dir)
@@ -243,8 +258,9 @@ if __name__ == '__main__':
 
     base_dir = "./data/nerf_synthetic/lego"
     device = 'mps'
-    batch_size = 1024
+    batch_size = 64
     max_step = 20000
+    eval_step = 5
     update_step = 1
     lr_init = 1e-3
     lr_final = 1e-5
@@ -266,8 +282,8 @@ if __name__ == '__main__':
         device=device,
         aabb=dataset.scene_bbox,
         resolution=256,
-        dense_ch=32,
-        color_ch=96,
+        dense_ch=8,
+        color_ch=8,
         app_ch=27,
         ipe_tol=3,
         ipe_factor=2,
@@ -313,6 +329,7 @@ if __name__ == '__main__':
         batch_size=batch_size,
         eval_batch_size=None,
         max_step=max_step,
+        eval_step=eval_step,
         update_step=update_step,
         device=device
     )
