@@ -260,8 +260,8 @@ if __name__ == '__main__':
     device = 'mps'
     batch_size = 64
     max_step = 20000
-    eval_step = 5
-    update_step = 1
+    eval_step = 5000
+    update_step = 100
     lr_init = 1e-3
     lr_final = 1e-5
     weight_decay = 1e-5
