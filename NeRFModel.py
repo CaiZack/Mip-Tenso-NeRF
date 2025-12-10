@@ -345,8 +345,12 @@ class TensorVMBase(nn.Module):
         return self._get_features(xyz, var, 'color', 'multiply')
         
     def forward(self, xyz: torch.Tensor, var: torch.Tensor):
-        sigma = self._get_density_features(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
-        rgb_feature = self._get_color_features(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
+        if self.use_ipe:
+            sigma = self._get_density_features(xyz.to(self.device), var.to(self.device))
+            rgb_feature = self._get_color_features(xyz.to(self.device), var.to(self.device))
+        else:
+            sigma = self._get_density_features(xyz.to(self.device), None)
+            rgb_feature = self._get_color_features(xyz.to(self.device), None)
         return sigma, rgb_feature
                 
 """
@@ -430,6 +434,7 @@ class TensorRF(nn.Module):
             dense_ch: int = 8,
             color_ch: int = 8,
             app_ch: int = 27,
+            use_ipe: bool = False,
             ipe_tol: int = 3,
             ipe_factor: int = 2,
             position_pe_dim: int = 10,
@@ -444,6 +449,7 @@ class TensorRF(nn.Module):
         self.dense_ch = dense_ch
         self.color_ch = color_ch
         self.app_ch = app_ch
+        self.use_ipe = use_ipe
         self.ipe_tol = ipe_tol
         self.ipe_factor = ipe_factor
         self.position_pe_dim = position_pe_dim
@@ -457,6 +463,7 @@ class TensorRF(nn.Module):
             dense_ch=self.dense_ch,
             color_ch=self.color_ch,
             app_ch=self.app_ch,
+            use_ipe=self.use_ipe,
             ipe_tol=self.ipe_tol,
             ipe_factor=self.ipe_factor,
         ).to(self.device)
@@ -472,9 +479,9 @@ class TensorRF(nn.Module):
         self.density_ReLU = nn.ReLU(True).to(self.device)
         self.color_Sigmoid = nn.Sigmoid().to(self.device)
         
-    def forward(self, viewdir: torch.Tensor, xyz: torch.Tensor, var: Optional[torch.Tensor] = None):
-        sigma, rgb_feature = self.tensoVMModel(xyz.to(self.device), var.to(self.device) if var is not None else None)
-        rgb = self.tensoColorMlp(rgb_feature, viewdir.to(self.device), xyz.to(self.device), var.to(self.device) if var is not None else None)
+    def forward(self, viewdir: torch.Tensor, xyz: torch.Tensor, var: torch.Tensor):
+        sigma, rgb_feature = self.tensoVMModel(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
+        rgb = self.tensoColorMlp(rgb_feature, viewdir.to(self.device), xyz.to(self.device), var.to(self.device) if self.use_ipe is not None else None)
         sigma = self.density_ReLU(sigma)
         rgb = self.color_Sigmoid(rgb)
         return sigma, rgb

@@ -258,10 +258,10 @@ if __name__ == '__main__':
 
     base_dir = "./data/nerf_synthetic/lego"
     device = 'mps'
-    batch_size = 64
+    batch_size = 512
     max_step = 20000
     eval_step = 5000
-    update_step = 100
+    update_step = 1
     lr_init = 1e-3
     lr_final = 1e-5
     weight_decay = 1e-5
@@ -285,6 +285,7 @@ if __name__ == '__main__':
         dense_ch=8,
         color_ch=8,
         app_ch=27,
+        use_ipe=False,
         ipe_tol=3,
         ipe_factor=2,
         position_pe_dim=10,
