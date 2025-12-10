@@ -186,18 +186,18 @@ class TensorVMBase(nn.Module):
             self.plane_weight, plane_shift_x, plane_shift_y = create_standard_2d_gaussian_weight_map(
                 self.ipe_tol, self.ipe_factor
             )
-            self.vector_weight = torch.tensor(self.vector_weight).unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(self.device) # [1, 1, N, 1]
+            self.vector_weight = torch.tensor(self.vector_weight, requires_grad=False).unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(self.device) # [1, 1, N, 1]
             vector_shift = torch.tensor(vector_shift, dtype=torch.float32)
             vector_shift_x, vector_shift_y = torch.meshgrid([vector_shift, torch.tensor(1, dtype=torch.float32)], indexing='ij')
             vector_shift_x = vector_shift_x.unsqueeze(-1)
             vector_shift_y = vector_shift_y.unsqueeze(-1)
-            self.vector_shift = torch.cat([vector_shift_x,vector_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, N, 1, 2]
-            self.plane_weight = torch.tensor(self.plane_weight).unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, Nx, Ny]
+            self.vector_shift = torch.cat([vector_shift_x,vector_shift_y], dim=-1).unsqueeze(0).clone().detach().requires_grad_(False).to(self.device) # [1, N, 1, 2]
+            self.plane_weight = torch.tensor(self.plane_weight, requires_grad=False).unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, Nx, Ny]
             plane_shift_x = torch.tensor(plane_shift_x, dtype=torch.float32)
             plane_shift_y = torch.tensor(plane_shift_y, dtype=torch.float32)
             plane_shift_x = plane_shift_x.unsqueeze(-1)
             plane_shift_y = plane_shift_y.unsqueeze(-1)
-            self.plane_shift = torch.cat([plane_shift_x,plane_shift_y], dim=-1).unsqueeze(0).to(self.device) # [1, Nx, Ny, 2]
+            self.plane_shift = torch.cat([plane_shift_x,plane_shift_y], dim=-1).unsqueeze(0).clone().detach().requires_grad_(False).to(self.device) # [1, Nx, Ny, 2]
     
     def _bilinear_grid(self, image: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         """
@@ -278,9 +278,11 @@ class TensorVMBase(nn.Module):
         if param_type == 'density':
             vectors = [self.dense_vector_x, self.dense_vector_y, self.dense_vector_z]
             planes = [self.dense_plane_yz, self.dense_plane_zx, self.dense_plane_xy]
+            feature_ch = self.dense_ch
         else:
             vectors = [self.color_vector_x, self.color_vector_y, self.color_vector_z]
             planes = [self.color_plane_yz, self.color_plane_zx, self.color_plane_xy]
+            feature_ch = self.color_ch
 
         for i in range(3):
             mask = torch.ones(3, dtype=torch.bool).to(self.device)
@@ -292,9 +294,9 @@ class TensorVMBase(nn.Module):
 
 
                 batch_vector_shift = self.vector_shift.expand(B,N,Hv,Wv)
-                batch_vector_weight = self.vector_weight.expand(B,self.dense_ch,N,1) # type: ignore
+                batch_vector_weight = self.vector_weight.expand(B,feature_ch,N,1) # type: ignore
                 batch_plane_shift = self.plane_shift.expand(B,N,Hp,Wp)
-                batch_plane_weight = self.plane_weight.expand(B,self.dense_ch,N,N) # type: ignore
+                batch_plane_weight = self.plane_weight.expand(B,feature_ch,N,N) # type: ignore
 
                 # Vector X and Plane YZ, vector_shift: [1, N, 1, 2]
                 query_x = batch_vector_shift * torch.cat([stdvar[:,0].unsqueeze(-1), torch.ones(B,1, device=self.device)], dim=-1).view(B,1,1,2).expand(B,N,1,2) + \
@@ -656,7 +658,7 @@ class RayRendering(nn.Module):
             rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
             sigma = sigma.view(B, self.num_samples[l], 1)
             rgb = rgb.view(B, self.num_samples[l], 3)
-            comp_rgb, distance, acc, weights, alpha = volumetric_rendering(rgb, sigma, t_vals, rays_directions, self.white_bkgd)
+            comp_rgb, distance, acc, weights, alpha = volumetric_rendering(rgb, sigma, t_vals.to(self.device), rays_directions.to(self.device), self.white_bkgd)
             comp_rgbs.append(comp_rgb)
             distances.append(distance)
             accs.append(acc)

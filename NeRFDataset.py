@@ -1,19 +1,35 @@
 import os
 from os import path
-import json
 import numpy as np
-import cv2
-from PIL import Image
 from typing import Optional
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 from load_blender import load_blender_data
 from load_deepvoxels import load_dv_data
 from load_LINEMOD import load_LINEMOD_data
 from load_llff import load_llff_data
 
-from ray_utils import Rays
+# Public function: Get rays of every pixels in one pose(image)
+def get_rays_from_pose(c2w, hwf, K):
+    H, W, _ = hwf
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
+    # Rotate ray directions from camera frame to the world frame
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # Normalize ray directions
+    rays_d_norm = np.linalg.norm(rays_d, axis=-1, keepdims=True)
+    rays_d = rays_d / (rays_d_norm + 1e-10)
+    # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
+    # Add radii for Mip-NeRF
+    dx = np.sqrt(np.sum((rays_d[:-1, :, :] - rays_d[1:, :, :])**2, axis=-1))
+    dy = np.sqrt(np.sum((rays_d[:, :-1, :] - rays_d[:, 1:, :])**2, axis=-1))
+    dx = np.pad(dx, ((0, 1), (0, 0)), mode='edge')
+    dy = np.pad(dy, ((0, 0), (0, 1)), mode='edge')
+    radii = 0.5 * (dx + dy) * (2.0 / np.sqrt(12.0))
+
+    return rays_o, rays_d, radii
 
 class NeRFDataset(Dataset):
     def __init__(
@@ -165,6 +181,15 @@ class NeRFDataset(Dataset):
         else:
             pass # Different camera captured image <---- TODO
         
+        self.render_poses = render_poses
+        self.test_images = images[i_test]
+        self.render_num = render_poses.shape[0]
+        self.hwf = hwf
+        self.near = near
+        self.far = far
+        self.K = K
+        #self.scene_bbox
+        
         # Transform data to rays and trained with random selected rays
         if self.data_type == 'rays':
             self.rays_data = self._get_all_rays_rgb(poses, images, near, far, 1, hwf, K, i_train)
@@ -172,27 +197,6 @@ class NeRFDataset(Dataset):
         # Use random data sequence to train a model <--- TODO
         elif self.data_type == 'images':
             pass
-
-    # Get rays of every pixels in one pose(image)
-    def _get_rays_from_pose(self, c2w, hwf, K):
-        H, W, _ = hwf
-        i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
-        dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
-        # Rotate ray directions from camera frame to the world frame
-        rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-        # Normalize ray directions
-        rays_d_norm = np.linalg.norm(rays_d, axis=-1, keepdims=True)
-        rays_d = rays_d / (rays_d_norm + 1e-10)
-        # Translate camera frame's origin to the world frame. It is the origin of all rays.
-        rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
-        # Add radii for Mip-NeRF
-        dx = np.sqrt(np.sum((rays_d[:-1, :, :] - rays_d[1:, :, :])**2, axis=-1))
-        dy = np.sqrt(np.sum((rays_d[:, :-1, :] - rays_d[:, 1:, :])**2, axis=-1))
-        dx = np.pad(dx, ((0, 1), (0, 0)), mode='edge')
-        dy = np.pad(dy, ((0, 0), (0, 1)), mode='edge')
-        radii = 0.5 * (dx + dy) * (2.0 / np.sqrt(12.0))
-
-        return rays_o, rays_d, radii
     
     # Gather every ray and rgb information
     # rays_ro_rd_rgb: [NumRays, 3 (Ro, Rd, RGB, radii, near, far, lossmulti)]
@@ -209,7 +213,7 @@ class NeRFDataset(Dataset):
             # Collect rays from all poses
             rays_list = []
             for p in poses[:, :3, :4]:
-                ray_o, ray_d, radii_val = self._get_rays_from_pose(p, hwf, K)
+                ray_o, ray_d, radii_val = get_rays_from_pose(p, hwf, K)
                 rays_list.append((ray_o, ray_d, radii_val))
             
             print('done, concats')
@@ -221,7 +225,7 @@ class NeRFDataset(Dataset):
             rays_data = np.concatenate([
                 ray_os.reshape(N, H, W, 3),          # Ro: [N, H, W, 3]
                 ray_ds.reshape(N, H, W, 3),          # Rd: [N, H, W, 3]
-                images[:, :, :, None],               # RGB: [N, H, W, 3]
+                images[:, :, :, :],                  # RGB: [N, H, W, 3]
                 radii.reshape(N, H, W, 1),           # Radii: [N, H, W, 1]
                 np.full((N, H, W, 1), near),         # near: [N, H, W, 1]
                 np.full((N, H, W, 1), far),          # far: [N, H, W, 1]
@@ -230,13 +234,13 @@ class NeRFDataset(Dataset):
             rays_data = rays_data[i_train]
             rays_data = rays_data.reshape(-1, 13)    # [NumRays, 13]
             rays_data = rays_data.astype(np.float32)
-            print('shuffle rays')
-            np.random.shuffle(rays_data)
+            #print('shuffle rays')
+            #np.random.shuffle(rays_data)
         else:
             pass
 
         return rays_data
-
+    
     def __len__(self):
         if self.data_type == 'rays':
             return self.rays_data.shape[0]
@@ -248,3 +252,43 @@ class NeRFDataset(Dataset):
             return self.rays_data[index]
         elif self.data_type == 'images':
             return 0
+
+if __name__ == '__main__':
+    import os
+    
+    # 设置数据集路径
+    base_dir = "./data/nerf_synthetic/lego"
+    
+    # 检查数据集是否存在
+    if not os.path.exists(base_dir):
+        print(f"错误: 数据集路径不存在: {base_dir}")
+        print("请下载Blender合成数据集并解压到该目录")
+        exit(1)
+    
+    print("开始测试 NeRFDataset 类...")
+
+    # 创建数据集
+    dataset = NeRFDataset(
+        base_dir=base_dir,
+        dataset_type='blender',
+        split='train',
+        data_type='rays',
+        half_res=False,
+        white_bkgd=True
+    )
+    
+    print(f"✓ 数据集创建成功!")
+    print(f"数据集大小: {len(dataset)}") # type: ignore
+    print(f"数据形状: {dataset.rays_data.shape}")
+    
+    # 测试单条数据
+    sample = dataset[0]
+    print(f"\n单条数据样例:")
+    print(f"形状: {sample.shape}") # type: ignore
+    print(f"Ro: {sample[0:3]}")   # type: ignore
+    print(f"Rd: {sample[3:6]}")   # type: ignore
+    print(f"RGB: {sample[6:9]}")  # type: ignore
+    print(f"Radii: {sample[9]}")  # type: ignore
+    print(f"Near: {sample[10]}")  # type: ignore
+    print(f"Far: {sample[11]}")   # type: ignore
+        
