@@ -6,4 +6,4 @@ Mip-Tenso-NeRF.code-workspace
 
 # Ignore all test files
 *.ipynb
-output/
+output*/

@@ -15,7 +15,7 @@ def pdf_2d(x, y):
     return np.exp(-(x**2 + y**2)/2) / (2*np.pi)
 
 def pdf_1d(x):
-    return np.exp(-(x**2)/2) / (2*np.pi)
+    return np.exp(-(x**2)/2) / np.sqrt(2*np.pi)
 
 """
 Generate pre calculated gaussian weight for gathering features from plane.
@@ -127,49 +127,49 @@ class TensorVMBase(nn.Module):
         self.ipe_tol = ipe_tol
         self.ipe_factor = ipe_factor
 
-        # Creating VM decomposition parameters - Vectors
+        # Creating VM decomposition parameters - Vectors [C L]
         self.color_vector_x = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+            torch.randn(self.color_ch, self.resolution) * 0.5
         ).to(self.device)
         self.color_vector_y = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+            torch.randn(self.color_ch, self.resolution) * 0.5
         ).to(self.device)
         self.color_vector_z = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, 1) * 0.1
+            torch.randn(self.color_ch, self.resolution) * 0.5
         ).to(self.device)
         if not self.dense_ch == 0:
             self.dense_vector_x = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
+                torch.randn(self.dense_ch, self.resolution) * 0.5
             ).to(self.device)
             self.dense_vector_y = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
+                torch.randn(self.dense_ch, self.resolution) * 0.5
             ).to(self.device)
             self.dense_vector_z = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, 1) * 0.1
+                torch.randn(self.dense_ch, self.resolution) * 0.5
             ).to(self.device)
         else:
             self.dense_vector_x = self.color_vector_x
             self.dense_vector_y = self.color_vector_y
             self.dense_vector_z = self.color_vector_z
-        # Creating VM decomposition parameters - Matrix
+        # Creating VM decomposition parameters - Matrix [C H W]
         self.color_plane_yz = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+            torch.randn(self.color_ch, self.resolution, self.resolution) * 0.5
         ).to(self.device)
         self.color_plane_zx = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+            torch.randn(self.color_ch, self.resolution, self.resolution) * 0.5
         ).to(self.device)
         self.color_plane_xy = nn.Parameter(
-            torch.randn(1, self.color_ch, self.resolution, self.resolution) * 0.1
+            torch.randn(self.color_ch, self.resolution, self.resolution) * 0.5
         ).to(self.device)
         if not self.dense_ch == 0:
             self.dense_plane_yz = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+                torch.randn(self.dense_ch, self.resolution, self.resolution) * 0.5
             ).to(self.device)
             self.dense_plane_zx = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+                torch.randn(self.dense_ch, self.resolution, self.resolution) * 0.5
             ).to(self.device)
             self.dense_plane_xy = nn.Parameter(
-                torch.randn(1, self.dense_ch, self.resolution, self.resolution) * 0.1
+                torch.randn(self.dense_ch, self.resolution, self.resolution) * 0.5
             ).to(self.device)
         else:
             self.dense_plane_yz = self.color_plane_yz
@@ -180,97 +180,95 @@ class TensorVMBase(nn.Module):
 
         # If using ipe, pre compute the gaussian weight to fetching from feature map
         if self.use_ipe:
-            self.vector_weight, vector_shift = create_standard_1d_gaussian_weight_map(
+            vector_weight, vector_shift = create_standard_1d_gaussian_weight_map(
                 self.ipe_tol, self.ipe_factor
             )
-            self.plane_weight, plane_shift_x, plane_shift_y = create_standard_2d_gaussian_weight_map(
+            plane_weight, plane_shift_x, plane_shift_y = create_standard_2d_gaussian_weight_map(
                 self.ipe_tol, self.ipe_factor
             )
-            self.vector_weight = torch.tensor(self.vector_weight, requires_grad=False).unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(self.device) # [1, 1, N, 1]
-            vector_shift = torch.tensor(vector_shift, dtype=torch.float32)
-            vector_shift_x, vector_shift_y = torch.meshgrid([vector_shift, torch.tensor(1, dtype=torch.float32)], indexing='ij')
-            vector_shift_x = vector_shift_x.unsqueeze(-1)
-            vector_shift_y = vector_shift_y.unsqueeze(-1)
-            self.vector_shift = torch.cat([vector_shift_x,vector_shift_y], dim=-1).unsqueeze(0).clone().detach().requires_grad_(False).to(self.device) # [1, N, 1, 2]
-            self.plane_weight = torch.tensor(self.plane_weight, requires_grad=False).unsqueeze(0).unsqueeze(0).to(self.device) # [1, 1, Nx, Ny]
+            self.vector_weight = torch.tensor(vector_weight, dtype=torch.float32).to(self.device) # [N]
+            self.vector_shift = torch.tensor(vector_shift, dtype=torch.float32).to(self.device) # [N]
+            self.plane_weight = torch.tensor(plane_weight).to(self.device) # [Nx, Ny]
             plane_shift_x = torch.tensor(plane_shift_x, dtype=torch.float32)
             plane_shift_y = torch.tensor(plane_shift_y, dtype=torch.float32)
-            plane_shift_x = plane_shift_x.unsqueeze(-1)
-            plane_shift_y = plane_shift_y.unsqueeze(-1)
-            self.plane_shift = torch.cat([plane_shift_x,plane_shift_y], dim=-1).unsqueeze(0).clone().detach().requires_grad_(False).to(self.device) # [1, Nx, Ny, 2]
+            self.plane_shift = torch.stack([plane_shift_x, plane_shift_y], dim=-1).to(self.device) # [Nx, Ny, 2]
     
+    def _bilinear(self, signal: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            signal: [C, L0]  # L0是原始信号长度
+            grid: [N]  # x坐标
+        
+        Returns:
+            [N, C]  # 插值后的信号
+        """
+        # Check grid input
+        assert grid.dim() == 1, f"grid shoule be 1-D tensor=, get {grid.dim()}-D."
+        
+        C, L0 = signal.shape
+        N = grid.shape[0]
+        
+        x = grid  # [N]
+        
+        x0 = torch.floor(x).long().clamp(0, L0 - 1)  # [N]
+        x1 = (x0 + 1).clamp(0, L0 - 1)  # [N]
+        
+        x0_f = x0.float()
+        x1_f = x1.float()
+        wa = x1_f - x  # [N] : weight left
+        wb = x - x0_f  # [N] : weight right
+        
+        v0 = signal[:, x0]  # [C, N]
+        v1 = signal[:, x1]  # [C, N]
+        
+        result = (v0 * wa.unsqueeze(0) + v1 * wb.unsqueeze(0)).permute(1, 0)  # [N, C]
+        return result
+
     def _bilinear_grid(self, image: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image: [1, C, H0, W0] 
-            grid: [N, H, W, 2(x,y)] 
+            image: [C, H0, W0] 
+            grid: [N, 2(x,y)] 
         
         Returns:
-            [N, C, H, W] 插值后的图像
+            [N, C] 插值后的图像
         """
-        _, C, H0, W0 = image.shape
-        N, H, W, _ = grid.shape
+        C, H0, W0 = image.shape
+        N, _ = grid.shape
 
-        x = grid[..., 0]
-        y = grid[..., 1]
-        # Restrict grid position
-        x0 = torch.floor(x).long().clamp(0, H0 - 1)
-        x1 = (x0 + 1).clamp(0, H0 - 1)
-        y0 = torch.floor(y).long().clamp(0, W0 - 1)
-        y1 = (y0 + 1).clamp(0, W0 - 1)
+        x = grid[..., 0]  # [N]
+        y = grid[..., 1]  # [N]
+        
+        x0 = torch.floor(x).long().clamp(0, H0 - 1)  # [N]
+        x1 = (x0 + 1).clamp(0, H0 - 1)  # [N]
+        y0 = torch.floor(y).long().clamp(0, W0 - 1)  # [N]
+        y1 = (y0 + 1).clamp(0, W0 - 1)  # [N]
 
-        # Weight
         x0_f = x0.float()
         x1_f = x1.float()
         y0_f = y0.float()
         y1_f = y1.float()
+        wa = (x1_f - x) * (y1_f - y)  # [N]
+        wb = (x1_f - x) * (y - y0_f)  # [N]
+        wc = (x - x0_f) * (y1_f - y)  # [N]
+        wd = (x - x0_f) * (y - y0_f)  # [N]
+
+        v00 = image[:, x0, y0]  # [C, N]
+        v01 = image[:, x0, y1]  # [C, N]
+        v10 = image[:, x1, y0]  # [C, N]
+        v11 = image[:, x1, y1]  # [C, N]
+
+        result = (v00 * wa.unsqueeze(0) + 
+                v01 * wb.unsqueeze(0) + 
+                v10 * wc.unsqueeze(0) + 
+                v11 * wd.unsqueeze(0)).permute(1, 0)  # [N, C]
         
-        wa = (x1_f - x) * (y1_f - y)
-        wb = (x1_f - x) * (y - y0_f)
-        wc = (x - x0_f) * (y1_f - y)
-        wd = (x - x0_f) * (y - y0_f)
-
-        # Flat image
-        image_flat = image.view(C, H0 * W0)  # [C, H0*W0]
-        
-        # Indexes
-        indices_x0y0 = (x0 * W0 + y0).view(N, -1)  # [N, H*W]
-        indices_x0y1 = (x0 * W0 + y1).view(N, -1)
-        indices_x1y0 = (x1 * W0 + y0).view(N, -1)
-        indices_x1y1 = (x1 * W0 + y1).view(N, -1)
-
-        # Allocating result
-        result = torch.zeros(N, C, H * W, device=image.device, dtype=image.dtype)
-
-        # Flat weight
-        wa = wa.view(N, -1)
-        wb = wb.view(N, -1)
-        wc = wc.view(N, -1)
-        wd = wd.view(N, -1)
-
-        # Calculate with each channel
-        for c in range(C):
-            channel_data = image_flat[c]  # [H0*W0]
-            
-            # 直接索引获取值（比gather更快，因为batch size=1）
-            v00 = channel_data[indices_x0y0]  # [N, H*W]
-            v01 = channel_data[indices_x0y1]
-            v10 = channel_data[indices_x1y0]
-            v11 = channel_data[indices_x1y1]
-            
-            # 加权求和
-            result[:, c, :] = (v00 * wa + 
-                            v01 * wb + 
-                            v10 * wc + 
-                            v11 * wd)
-        
-        # 重塑为最终形状 [N, C, H, W]
-        return result.view(N, C, H, W)
+        return result
 
     def _get_features(self, xyz: torch.Tensor, var: Optional[torch.Tensor] = None, param_type: str = 'density', method: str = 'sum'):
         B = xyz.shape[0]
         # xyz: [B, 3]; var: [B, 3]
-        rescale_ratio = (self.aabb[0,:] - self.aabb[1,:]) * (self.resolution - 1)
+        rescale_ratio = 1 / (self.aabb[1,:] - self.aabb[0,:]) * (self.resolution - 1)
         # Remap XYZ and VAR to the Parameter Region
         xyz = (xyz - self.aabb[0,:]) * rescale_ratio
 
@@ -283,49 +281,49 @@ class TensorVMBase(nn.Module):
             vectors = [self.color_vector_x, self.color_vector_y, self.color_vector_z]
             planes = [self.color_plane_yz, self.color_plane_zx, self.color_plane_xy]
             feature_ch = self.color_ch
+        
+        if var is not None:
+            stdvar = torch.sqrt(var) * rescale_ratio
+            N, = self.vector_shift.shape
+            Nx, Ny, _ = self.plane_shift.shape
+
+            batch_vector_shift = self.vector_shift.view(1,N).expand(B,N) # [B N]
+            batch_vector_weight = self.vector_weight.view(1,N,1).expand(B,N,feature_ch) # [B N C]
+            batch_plane_shift = self.plane_shift.view(1,Nx*Ny,2).expand(B,Nx*Ny,2) # [B Nx*Ny 2]
+            batch_plane_weight = self.plane_weight.view(1,Nx*Ny,1).expand(B,Nx*Ny,feature_ch) # [B Nx*Ny C]
 
         for i in range(3):
             mask = torch.ones(3, dtype=torch.bool).to(self.device)
             mask[i] = False
             if var is not None:
-                stdvar = torch.sqrt(var) * rescale_ratio
-                _, N, Hv, Wv = self.vector_shift.shape
-                _, N, Hp, Wp = self.plane_shift.shape
 
-
-                batch_vector_shift = self.vector_shift.expand(B,N,Hv,Wv)
-                batch_vector_weight = self.vector_weight.expand(B,feature_ch,N,1) # type: ignore
-                batch_plane_shift = self.plane_shift.expand(B,N,Hp,Wp)
-                batch_plane_weight = self.plane_weight.expand(B,feature_ch,N,N) # type: ignore
-
-                # Vector X and Plane YZ, vector_shift: [1, N, 1, 2]
-                query_x = batch_vector_shift * torch.cat([stdvar[:,0].unsqueeze(-1), torch.ones(B,1, device=self.device)], dim=-1).view(B,1,1,2).expand(B,N,1,2) + \
-                        torch.cat([xyz[:,0].unsqueeze(-1), torch.ones(B,1, device=self.device)], dim=-1).view(B,1,1,2).expand(B,N,1,2) # shape: [B, N, 1, 2]
+                # Vector X and Plane YZ
+                query_vec = (batch_vector_shift * stdvar[:,i].unsqueeze(-1).expand(B,N)).view(B*N) + \
+                          (xyz[:,0].unsqueeze(-1).view(B,1).expand(B,N)).reshape(B*N) # shape: [B, N]
                 vector_coef = (torch.sum(
-                    self._bilinear_grid(
-                        vectors[i],
-                        query_x
-                    ) * batch_vector_weight, 
-                    dim=(2,3)
-                    ) / N).float() # [B, C]
-                query_yz = batch_plane_shift * stdvar[:,mask].view(B,1,1,2).expand(B,N,N,2) + \
-                        xyz[:,mask].view(B,1,1,2).expand(B,N,N,2) # shape: [B, Nx, Ny, 2]
+                    self._bilinear(
+                        vectors[i], # [C L]
+                        query_vec # [B*N]
+                    ).view(B,N,feature_ch) * batch_vector_weight, 
+                    dim=1) / N) # [B, C]
+                
+                query_plane = (batch_plane_shift * stdvar[:,mask].view(B,1,2).expand(B,Nx*Ny,2)).view(B*Nx*Ny,2) + \
+                        (xyz[:,mask].view(B,1,2).expand(B,Nx*Ny,2)).reshape(B*Nx*Ny,2) # shape: [B*Nx*Ny, 2]
                 plane_coef = (torch.sum(
                     self._bilinear_grid(
                         planes[i],
-                        query_yz,
-                        ) * batch_plane_weight,
-                    dim=(2,3)
-                    ) / (N * N)).float() # [B, C]
+                        query_plane,
+                        ).view(B, Nx*Ny, feature_ch) * batch_plane_weight,
+                    dim=1) / (Nx * Ny)) # [B, C]
             else:
-                vector_coef = self._bilinear_grid(
+                vector_coef = self._bilinear(
                     vectors[i],
-                    torch.cat([xyz[:,i].unsqueeze(-1), torch.ones(B,1, device=self.device)], dim=-1).view(B,1,1,2), # [B, 1, 1, 2]
-                ).float().squeeze(-1).squeeze(-1) # [B, C]
+                    xyz[:,i] # [B]
+                ) # [B, C]
                 plane_coef = self._bilinear_grid(
                     planes[i],
-                    xyz[:,mask].view(B,1,1,2), # [B, 1, 1, 2]
-                ).float().squeeze(-1).squeeze(-1) # [B, C]
+                    xyz[:,mask], # [B, 2]
+                ) # [B, C]
 
             coefs.append(vector_coef * plane_coef) # [B, C] [3]
         
@@ -434,7 +432,8 @@ class TensorRF(nn.Module):
             dense_ch: int = 8,
             color_ch: int = 8,
             app_ch: int = 27,
-            use_ipe: bool = False,
+            use_ipe_tenso: bool = False,
+            use_ipe_mlp: bool = True,
             ipe_tol: int = 3,
             ipe_factor: int = 2,
             position_pe_dim: int = 10,
@@ -449,7 +448,8 @@ class TensorRF(nn.Module):
         self.dense_ch = dense_ch
         self.color_ch = color_ch
         self.app_ch = app_ch
-        self.use_ipe = use_ipe
+        self.use_ipe_tenso = use_ipe_tenso
+        self.use_ipe_mlp = use_ipe_mlp
         self.ipe_tol = ipe_tol
         self.ipe_factor = ipe_factor
         self.position_pe_dim = position_pe_dim
@@ -463,7 +463,7 @@ class TensorRF(nn.Module):
             dense_ch=self.dense_ch,
             color_ch=self.color_ch,
             app_ch=self.app_ch,
-            use_ipe=self.use_ipe,
+            use_ipe=self.use_ipe_tenso,
             ipe_tol=self.ipe_tol,
             ipe_factor=self.ipe_factor,
         ).to(self.device)
@@ -480,8 +480,8 @@ class TensorRF(nn.Module):
         self.color_Sigmoid = nn.Sigmoid().to(self.device)
         
     def forward(self, viewdir: torch.Tensor, xyz: torch.Tensor, var: torch.Tensor):
-        sigma, rgb_feature = self.tensoVMModel(xyz.to(self.device), var.to(self.device) if self.use_ipe else None)
-        rgb = self.tensoColorMlp(rgb_feature, viewdir.to(self.device), xyz.to(self.device), var.to(self.device) if self.use_ipe is not None else None)
+        sigma, rgb_feature = self.tensoVMModel(xyz.to(self.device), var.to(self.device) if self.use_ipe_tenso else None)
+        rgb = self.tensoColorMlp(rgb_feature, viewdir.to(self.device), xyz.to(self.device), var.to(self.device) if self.use_ipe_mlp else None)
         sigma = self.density_ReLU(sigma)
         rgb = self.color_Sigmoid(rgb)
         return sigma, rgb
@@ -736,6 +736,7 @@ if __name__ == "__main__":
         dense_ch=8,
         color_ch=8,
         app_ch=27,
+        use_ipe=True,
         ipe_tol=3,
         ipe_factor=2,
         position_pe_dim=10,

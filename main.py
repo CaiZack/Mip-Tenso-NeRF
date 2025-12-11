@@ -17,6 +17,7 @@ from NeRFDataset import NeRFDataset, get_rays_from_pose
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
+mse2psnr_np = lambda x : -10. * np.log(x) / np.log(10)
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 class NeRF_Trainer():
@@ -30,6 +31,7 @@ class NeRF_Trainer():
             optimizer: Optional[Optimizer] = None,
             lr_scheduler: Optional[LRScheduler] = None,
             batch_size: int = 1024,
+            grad_accu_step: int = 4,
             eval_batch_size: Optional[int] = None,
             max_step: int = 20000,
             eval_step: int = 5000,
@@ -45,6 +47,7 @@ class NeRF_Trainer():
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.batch_size = batch_size
+        self.grad_accu_step = grad_accu_step
         self.eval_batch_size = eval_batch_size if eval_batch_size is not None else batch_size
         self.device = device
         self.max_step = max_step
@@ -58,24 +61,30 @@ class NeRF_Trainer():
 
         # From dataset create dataloader
         if self.dataset is not None:
-            self.dataloader = DataLoader(
-                self.dataset,
-                self.batch_size,
-                shuffle=True
-            )
+            self.dataloader = self.create_dataloader()
             self.data_iter = iter(self.dataloader)
 
         if self.loss_fn is None:
             self.loss_fn = F.mse_loss
 
+    def create_dataloader(self):
+        assert self.dataset is not None, 'Must specify dataset'
+        return DataLoader(
+                self.dataset,
+                self.batch_size,
+                shuffle=True,
+                drop_last=True,
+            )
+
     def render(self, poses, hwf, K, near, far, step = None, images: Optional[np.ndarray] = None, rand_sel: int = 1):
         # Managing files
         if step is not None:
-            self.eval_log_file = os.path.join(self.output_dir, f'eval_{step}_log.txt')
             self.eval_output_dir = os.path.join(self.output_dir, f'eval_{step}')
+            self.eval_log_file = os.path.join(self.eval_output_dir, f'eval_{step}_log.txt')
         else:
-            self.eval_log_file = os.path.join(self.output_dir, f'eval_log.txt')
             self.eval_output_dir = os.path.join(self.output_dir, f'eval')
+            self.eval_log_file = os.path.join(self.eval_output_dir, f'eval_log.txt')
+        os.makedirs(self.eval_output_dir, exist_ok=True)
         
         # Whether output per image psnr.
         if images is not None:
@@ -127,7 +136,7 @@ class NeRF_Trainer():
         eval_start_time = time.time()
         while keep_eval:
             next_idx = current_idx + self.eval_batch_size
-            if next_idx > total_idx:
+            if next_idx >= total_idx:
                 next_idx = total_idx
                 keep_eval = False
             batch = rays_data[current_idx:next_idx]
@@ -144,7 +153,7 @@ class NeRF_Trainer():
             file.write(f'Eval time, {eval_time}, \n')
         
         # Split results in to images
-        result_rgb = result_rgb.view(N, H, W, 3).numpy()
+        result_rgb = result_rgb.view(N, H, W, 3).cpu().numpy()
         psnr_all = []
         mse_all = []
         imageList = []
@@ -156,7 +165,7 @@ class NeRF_Trainer():
                 target = images[idx]
                 mse = float(np.mean(np.square(image - target)))
                 mse_all.append(mse)
-                psnr = float(mse2psnr(mse))
+                psnr = float(mse2psnr_np(mse))
                 psnr_all.append(psnr)
                 with open(self.eval_log_file, '+a') as file:
                     file.write(f'Frame, {idx}, MSE, {mse}, PSNR, {psnr}, \n')
@@ -166,7 +175,7 @@ class NeRF_Trainer():
             image = Image.fromarray(image).save(freme_name)
         
         # Save video if not test
-        if image is None:
+        if images is None:
             video_name = os.path.join(self.eval_output_dir, f'video.mp4')
             imageio.mimwrite(video_name, imageList, fps=30, quality=8)
         avg_mse = np.mean(mse_all)
@@ -201,17 +210,25 @@ class NeRF_Trainer():
         start_time = time.time()
 
         # Training iters
+        self.optimizer.zero_grad()
         for step in range(self.max_step):
-            self.model.train()
 
             step_start_time = time.time()
-            batch = next(self.data_iter).to(self.device)
+            try:
+                batch = next(self.data_iter).to(self.device)
+            except:
+                self.dataloader = self.create_dataloader()
+                self.data_iter = iter(self.dataloader)
+                batch = next(self.data_iter).to(self.device)
+            
             comp_rgbs, _, _ = self.model(batch)
             loss = self.loss_fn(comp_rgbs, batch[:,6:9].expand(comp_rgbs.shape))
-            self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
             self.lr_scheduler.step()
+
+            if (step+1) % self.grad_accu_step == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
             psnr = mse2psnr(loss.detach().cpu())
             step_end_time = time.time()
@@ -238,19 +255,19 @@ class NeRF_Trainer():
                     self.dataset.far, 
                     step, 
                     self.dataset.test_images)
-                self.render(
-                    self.dataset.render_poses,
-                    self.dataset.hwf, 
-                    self.dataset.K, 
-                    self.dataset.near, 
-                    self.dataset.far, 
-                    step,
-                    None
-                )
+                self.model.train()
         
+        self.render(
+            np.array(self.dataset.render_poses),
+            self.dataset.hwf, 
+            self.dataset.K, 
+            self.dataset.near, 
+            self.dataset.far, 
+            step,
+            None
+        )
         model_dir = os.path.join(self.ckpt_dir, f'{self.name}-Last-ckpt.pth')
         torch.save(self.model, model_dir)
-    
     def load_model(self, ckpt):
         self.model = torch.load(ckpt).to(self.device)
 
@@ -258,10 +275,11 @@ if __name__ == '__main__':
 
     base_dir = "./data/nerf_synthetic/lego"
     device = 'mps'
-    batch_size = 512
-    max_step = 20000
-    eval_step = 5000
-    update_step = 1
+    batch_size = 1024
+    grad_accu_step = 4
+    max_step = 200000 * grad_accu_step
+    eval_step = 5000 * grad_accu_step
+    update_step = 10
     lr_init = 1e-3
     lr_final = 1e-5
     weight_decay = 1e-5
@@ -285,9 +303,10 @@ if __name__ == '__main__':
         dense_ch=8,
         color_ch=8,
         app_ch=27,
-        use_ipe=False,
+        use_ipe_tenso=False,
+        use_ipe_mlp=False,
         ipe_tol=3,
-        ipe_factor=2,
+        ipe_factor=1,
         position_pe_dim=10,
         viewdir_pe_dim=4,
         mlp_color_feature=128,
@@ -328,6 +347,7 @@ if __name__ == '__main__':
         optimizer=optimizer,
         lr_scheduler=scheduler,
         batch_size=batch_size,
+        grad_accu_step=gradient_accu_step,
         eval_batch_size=None,
         max_step=max_step,
         eval_step=eval_step,
