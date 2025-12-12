@@ -195,9 +195,6 @@ class NeRF_Trainer():
         if self.optimizer is None:
             print('Need optimizer.')
             return
-        if self.lr_scheduler is None:
-            print('Need lr_scheduler.')
-            return
         
         # Create dir
         self.train_log_dir = os.path.join(self.output_dir, 'train_log.txt')
@@ -228,7 +225,9 @@ class NeRF_Trainer():
             if (step+1) % self.grad_accu_step == 0:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-            self.lr_scheduler.step()
+                
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
             psnr = mse2psnr(loss.detach().cpu())
             step_end_time = time.time()
@@ -325,17 +324,18 @@ if __name__ == '__main__':
     )
 
     print('Get optimizer')
-    optimizer = torch.optim.AdamW(
-        tensorrf_model.parameters(),
-        lr=lr_init,
-        weight_decay=weight_decay,
-    )
+    optimizer = torch.optim.Adam([
+        {'params': tensorrf_model.tensoVMModel.parameters(), 'lr': 0.02},
+        {'params': tensorrf_model.tensoColorMlp.parameters(), 'lr': 0.001},
+    ])
 
+    '''
     print('Get lr_scheduler')
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max_step,
     )
+    '''
 
     print('Get train code')
     trainer = NeRF_Trainer(
@@ -345,7 +345,7 @@ if __name__ == '__main__':
         dataset=dataset,
         loss_fn=None,
         optimizer=optimizer,
-        lr_scheduler=scheduler,
+        lr_scheduler=None,
         batch_size=batch_size,
         grad_accu_step=grad_accu_step,
         eval_batch_size=None,
