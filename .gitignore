@@ -1,7 +1,8 @@
 # Ignore data folder
 data/
 
-# Ignore vscode workspace
+# Ignore vscode workspace and python caches
+__pycache__
 Mip-Tenso-NeRF.code-workspace
 
 # Ignore all test files

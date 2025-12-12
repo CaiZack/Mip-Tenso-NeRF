@@ -224,11 +224,11 @@ class NeRF_Trainer():
             comp_rgbs, _, _ = self.model(batch)
             loss = self.loss_fn(comp_rgbs, batch[:,6:9].expand(comp_rgbs.shape))
             loss.backward()
-            self.lr_scheduler.step()
 
             if (step+1) % self.grad_accu_step == 0:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+            self.lr_scheduler.step()
 
             psnr = mse2psnr(loss.detach().cpu())
             step_end_time = time.time()
@@ -347,7 +347,7 @@ if __name__ == '__main__':
         optimizer=optimizer,
         lr_scheduler=scheduler,
         batch_size=batch_size,
-        grad_accu_step=gradient_accu_step,
+        grad_accu_step=grad_accu_step,
         eval_batch_size=None,
         max_step=max_step,
         eval_step=eval_step,
